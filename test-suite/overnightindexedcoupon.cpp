@@ -21,6 +21,7 @@
 #include "utilities.hpp"
 #include <ql/math/interpolations/cubicinterpolation.hpp>
 #include <ql/cashflows/cashflows.hpp>
+#include <ql/currencies/europe.hpp>
 #include <ql/cashflows/iborcoupon.hpp>
 #include <ql/cashflows/overnightindexedcoupon.hpp>
 #include <ql/cashflows/overnightindexedcouponpricer.hpp>
@@ -2044,6 +2045,64 @@ BOOST_AUTO_TEST_CASE(testOvernightLegWeekendStub) {
     }
 }
 
+BOOST_AUTO_TEST_CASE(testDefaultLookbackWithObservationShift) {
+    BOOST_TEST_MESSAGE("Testing default overnight lookback with observation shift...");
+
+    const Date today(15, January, 2026);
+    Settings::instance().evaluationDate() = today;
+    auto curve = ext::make_shared<FlatForward>(today, 0.04, Actual360());
+    for (Natural delay : {0, 1, 2}) {
+        auto index = ext::make_shared<OvernightIndex>(
+            "DefaultLookback" + std::to_string(delay), delay, EURCurrency(),
+            WeekendsOnly(), Actual360(), Handle<YieldTermStructure>(curve));
+        for (Date d(1, November, 2025); d <= today; ++d) {
+            if (index->isValidFixingDate(d))
+                index->addFixing(d, 0.04 + 0.001 * (d.serialNumber() % 7));
+        }
+        // Historical, partially fixed, and future coupons. Vary both boundaries
+        // over a full week to include non-business-day accrual boundaries.
+        for (Month month : {December, January, February}) {
+            const Year year = month == December ? 2025 : 2026;
+            for (Day start = 1; start <= 7; ++start) {
+                for (Day end = 19; end <= 25; ++end) {
+                    for (bool shift : {false, true}) {
+                        for (Natural lockout : {0, 2}) {
+                            for (bool telescopic : {false, true}) {
+                                const Date from(start, month, year), to(end, month, year);
+                                auto makeCoupon = [&](Natural lookback) {
+                                    return OvernightIndexedCoupon(
+                                        to, 1000000.0, from, to, index, 1.0, 0.0,
+                                        Date(), Date(), Actual360(), telescopic,
+                                        RateAveraging::Compound, lookback, lockout, shift);
+                                };
+                                auto defaultCoupon = makeCoupon(Null<Natural>());
+                                auto explicitCoupon = makeCoupon(delay);
+                                BOOST_CHECK_EQUAL_COLLECTIONS(
+                                    defaultCoupon.dt().begin(), defaultCoupon.dt().end(),
+                                    explicitCoupon.dt().begin(), explicitCoupon.dt().end());
+                                QL_CHECK_SMALL(defaultCoupon.amount() - explicitCoupon.amount(), 1e-8);
+                                // Independent fully fixed, zero-delay cash-flow oracle:
+                                // use clipped interest dates, not the coupon's dt array.
+                                if (month == December && delay == 0 && !telescopic) {
+                                    const auto& dates = defaultCoupon.interestDates();
+                                    const auto& fixings = defaultCoupon.indexFixings();
+                                    Real compound = 1.0;
+                                    for (Size i = 0; i < fixings.size(); ++i)
+                                        compound *= 1.0 + fixings[i] *
+                                            Actual360().yearFraction(dates[i], dates[i+1]);
+                                    QL_CHECK_SMALL(defaultCoupon.amount() -
+                                                   1000000.0 * (compound - 1.0), 1e-8);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE_END()
+
